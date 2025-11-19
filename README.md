@@ -90,11 +90,17 @@ Be aware that jobs can be canceled and requeued by the scheduler or underlying p
 
 ## Download logs to your computer
 
-- From your laptop, recursively copy a run directory using the DTN endpoint for reliable transfers to and from Greene.  
+Use `rsync` to copy results from the cluster to your local machine. It is faster and can resume interrupted transfers. Run this on your machine (NOT on Greene):
+
 ```
-scp -r <netid>@dtn.hpc.nyu.edu:/home/<netid>/rob6323_go2_project/logs ./logs
+rsync -avzP <netid>@dtn.hpc.nyu.edu:/home/<netid>/rob6323_go2_project/logs ./
 ```
-Using dtn.hpc.nyu.edu is recommended for large file transfers such as videos and event files.
+
+*Explanation of flags:*
+- `-a`: Archive mode (preserves permissions, times, and recursive).
+- `-v`: Verbose output.
+- `-z`: Compresses data during transfer (faster over network).
+- `-P`: Shows progress bar and allows resuming partial transfers.
 
 ## Visualize with TensorBoard
 
