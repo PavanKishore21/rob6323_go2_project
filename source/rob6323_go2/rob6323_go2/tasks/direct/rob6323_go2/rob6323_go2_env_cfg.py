@@ -104,26 +104,26 @@ class Rob6323Go2EnvCfg(DirectRLEnvCfg):
     current_vel_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
 
     # --------------------------------------------------------
-    # REWARD SCALES (Aligned with Professor's Targets)
+    # REWARD SCALES (Aligned with Professor's Exact Defaults)
     # --------------------------------------------------------
     lin_vel_reward_scale = 1.0
     yaw_rate_reward_scale = 0.5
 
     # Tutorial Part 1
-    action_rate_reward_scale = -0.01  # Reduced to prevent freezing
+    action_rate_reward_scale = -0.01
 
     # Tutorial Part 4
     raibert_heuristic_reward_scale = -10.0
 
-    # Tutorial Part 5 (Refining)
+    # Tutorial Part 5 (Refining) -- UPDATE THESE THREE LINES
     orient_reward_scale = -5.0
-    lin_vel_z_reward_scale = -2.0
+    lin_vel_z_reward_scale = -0.02  # Changed from -2.0 to -0.02
     dof_vel_reward_scale = -1e-4
-    ang_vel_xy_reward_scale = -0.05
+    ang_vel_xy_reward_scale = -0.001  # Changed from -0.05 to -0.001
 
-    # Rubric Requirement: Action Regularization
+    # Rubric Requirement
     action_l2_reward_scale = -0.0001
 
-    # Tutorial Part 6
-    feet_clearance_reward_scale = -10.0
+    # Tutorial Part 6 -- UPDATE THIS LINE
+    feet_clearance_reward_scale = -30.0  # Changed from -10.0 to -30.0
     tracking_contacts_shaped_force_reward_scale = 4.0
