@@ -12,8 +12,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.sensors import ContactSensor
 
-
-# from .rob6323_go2_env_cfg import Rob6323Go2EnvCfg
+from .rob6323_go2_env_cfg import Rob6323Go2EnvCfg
 
 
 class Rob6323Go2Env(DirectRLEnv):
@@ -90,6 +89,16 @@ class Rob6323Go2Env(DirectRLEnv):
         self._applied_torques: torch.Tensor = torch.zeros(
             self.num_envs, 12, device=self.device
         )
+
+        # --- BONUS IMPLEMENTATION: FRICTION PARAMETERS ---
+        # Stored as (num_envs, 12) to allow easy broadcasting during step
+        self.friction_coeffs_viscous: torch.Tensor = torch.zeros(
+            self.num_envs, 12, device=self.device
+        )
+        self.friction_coeffs_stiction: torch.Tensor = torch.zeros(
+            self.num_envs, 12, device=self.device
+        )
+        # -------------------------------------------------
 
         # -- Foot/body indexing --
         self._feet_ids: list[int] = []  # Robot body indices (for positions)
@@ -299,14 +308,35 @@ class Rob6323Go2Env(DirectRLEnv):
 
     def _apply_action(self) -> None:
         """
-        Apply manual PD torques (with saturation) as joint effort targets.
+        Apply manual PD torques with friction model as joint effort targets.
         """
-        self._applied_torques = torch.clip(
+        #
+        # 1. Compute Base PD Torque
+        pd_torque = (
             self.Kp * (self.desired_joint_pos - self.robot.data.joint_pos)
-            - self.Kd * self.robot.data.joint_vel,
-            -self.torque_limits,
-            self.torque_limits,
+            - self.Kd * self.robot.data.joint_vel
         )
+
+        # 2. Compute Friction Torque (Bonus Implementation)
+        # formula: tau_friction = tau_stiction + tau_viscous
+        # tau_stiction = Fs * tanh(q_dot / 0.1)
+        # tau_viscous = mu_v * q_dot
+        q_dot = self.robot.data.joint_vel
+
+        tau_stiction = self.friction_coeffs_stiction * torch.tanh(q_dot / 0.1)
+        tau_viscous = self.friction_coeffs_viscous * q_dot
+
+        tau_friction = tau_stiction + tau_viscous
+
+        # 3. Subtract Friction from PD Torque
+        torque_with_friction = pd_torque - tau_friction
+
+        # 4. Clip to Torque Limits
+        self._applied_torques = torch.clip(
+            torque_with_friction, -self.torque_limits, self.torque_limits
+        )
+
+        # 5. Send to Simulator
         self.robot.set_joint_effort_target(self._applied_torques)
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
@@ -486,6 +516,18 @@ class Rob6323Go2Env(DirectRLEnv):
         self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(
             -1.0, 1.0
         )
+
+        # --- BONUS IMPLEMENTATION: RANDOMIZE FRICTION ---
+        # Randomize friction params per-episode (per-robot)
+        # Viscous: U(0.0, 0.3), Stiction: U(0.0, 2.5)
+        num_reset = len(env_ids)
+
+        viscous_sample = torch.rand(num_reset, 1, device=self.device) * 0.3
+        self.friction_coeffs_viscous[env_ids] = viscous_sample.expand(-1, 12)
+
+        stiction_sample = torch.rand(num_reset, 1, device=self.device) * 2.5
+        self.friction_coeffs_stiction[env_ids] = stiction_sample.expand(-1, 12)
+        # ------------------------------------------------
 
         joint_pos: torch.Tensor = self.robot.data.default_joint_pos[env_ids]
         joint_vel: torch.Tensor = self.robot.data.default_joint_vel[env_ids]
