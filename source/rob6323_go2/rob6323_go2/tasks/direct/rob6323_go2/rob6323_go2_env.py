@@ -1,3 +1,8 @@
+# ============================================================================
+# UPDATED ENVIRONMENT FILE: rob6323_go2_env.py
+# Modifications to support rough terrain with height scanner
+# ============================================================================
+
 from __future__ import annotations
 
 import torch
@@ -10,7 +15,7 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, RayCaster
 
 from .rob6323_go2_env_cfg import Rob6323Go2EnvCfg
 
@@ -21,14 +26,6 @@ class Rob6323Go2Env(DirectRLEnv):
     def __init__(
         self, cfg: Rob6323Go2EnvCfg, render_mode: str | None = None, **kwargs: Any
     ):
-        """
-        Initialize buffers, logging accumulators, PD parameters, and gait state.
-
-        Args:
-            cfg (Rob6323Go2EnvCfg): Environment configuration.
-            render_mode (str | None): Render mode passed to the base env.
-            **kwargs (Any): Forwarded to the DirectRLEnv constructor.
-        """
         super().__init__(cfg, render_mode, **kwargs)
 
         # -- Action buffers --
@@ -90,19 +87,17 @@ class Rob6323Go2Env(DirectRLEnv):
             self.num_envs, 12, device=self.device
         )
 
-        # --- BONUS IMPLEMENTATION: FRICTION PARAMETERS ---
-        # Stored as (num_envs, 12) to allow easy broadcasting during step
+        # --- BONUS 1: FRICTION PARAMETERS ---
         self.friction_coeffs_viscous: torch.Tensor = torch.zeros(
             self.num_envs, 12, device=self.device
         )
         self.friction_coeffs_stiction: torch.Tensor = torch.zeros(
             self.num_envs, 12, device=self.device
         )
-        # -------------------------------------------------
 
         # -- Foot/body indexing --
-        self._feet_ids: list[int] = []  # Robot body indices (for positions)
-        self._feet_ids_sensor: list[int] = []  # Sensor indices (for forces)
+        self._feet_ids: list[int] = []
+        self._feet_ids_sensor: list[int] = []
         self._foot_names: list[str] = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
         self._base_id: int | None = None
 
@@ -120,8 +115,7 @@ class Rob6323Go2Env(DirectRLEnv):
             self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False
         )
 
-        # -- Pre-computed tensors for Raibert Heuristic (Optimization) --
-        # Defined here to avoid re-allocating them every step
+        # -- Pre-computed tensors for Raibert Heuristic --
         self.desired_width = 0.25
         self.desired_length = 0.45
         self.ys_nom = torch.tensor(
@@ -147,6 +141,9 @@ class Rob6323Go2Env(DirectRLEnv):
         self._indices_initialized: bool = False
         self._obs_validated: bool = False
 
+        # --- BONUS 2: HEIGHT SCANNER FLAG ---
+        self._has_height_scanner: bool = hasattr(self.cfg, "height_scanner")
+
         self.set_debug_vis(self.cfg.debug_vis)
 
     def _setup_scene(self) -> None:
@@ -155,6 +152,11 @@ class Rob6323Go2Env(DirectRLEnv):
         """
         self.robot: Articulation = Articulation(self.cfg.robot_cfg)
         self._contact_sensor: ContactSensor = ContactSensor(self.cfg.contact_sensor)
+
+        # --- BONUS 2: SETUP HEIGHT SCANNER (if configured) ---
+        if self._has_height_scanner:
+            self._height_scanner: RayCaster = RayCaster(self.cfg.height_scanner)
+            print("✓ Height scanner enabled for rough terrain")
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -166,6 +168,11 @@ class Rob6323Go2Env(DirectRLEnv):
             self.scene.filter_collisions(global_prim_paths=[])
 
         self.scene.articulations["robot"] = self.robot
+        self.scene.sensors["contact_sensor"] = self._contact_sensor
+
+        # --- BONUS 2: ADD HEIGHT SCANNER TO SCENE ---
+        if self._has_height_scanner:
+            self.scene.sensors["height_scanner"] = self._height_scanner
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -177,105 +184,27 @@ class Rob6323Go2Env(DirectRLEnv):
         if self._indices_initialized:
             return
 
-        print("\n" + "=" * 70)
-        print(" INITIALIZING BODY AND SENSOR INDICES")
-        print("=" * 70)
-
         try:
-            # Find base body (optional, for reference)
+            # Find base body (optional)
             try:
                 base_ids, _ = self._contact_sensor.find_bodies("base")
                 if len(base_ids) > 0:
                     self._base_id = int(base_ids[0])
-                    print(f"✓ Base body found at sensor index: {self._base_id}")
             except Exception:
-                print("  (Base body not found in sensor - this is OK)")
+                pass
 
             # Find foot bodies
-            print(f"\nSearching for {len(self._foot_names)} foot bodies...")
-
             for name in self._foot_names:
-                # 1. Find in robot articulation (for position queries)
                 robot_ids, robot_names = self.robot.find_bodies(name)
-                if len(robot_ids) == 0:
-                    raise RuntimeError(
-                        f"Foot '{name}' not found in robot articulation. "
-                        f"Available bodies: {self.robot.body_names}"
-                    )
                 robot_idx = int(robot_ids[0])
                 self._feet_ids.append(robot_idx)
 
-                # 2. Find in contact sensor (for force queries)
                 sensor_ids, sensor_names = self._contact_sensor.find_bodies(name)
-                if len(sensor_ids) == 0:
-                    raise RuntimeError(
-                        f"Foot '{name}' not found in contact sensor. "
-                        f"Check contact_sensor prim_path: '{self.cfg.contact_sensor.prim_path}'. "
-                        f"Sensor bodies: {self._contact_sensor.body_names}"
-                    )
                 sensor_idx = int(sensor_ids[0])
                 self._feet_ids_sensor.append(sensor_idx)
 
-                print(
-                    f"  ✓ {name:12s}: robot_idx={robot_idx:2d}, sensor_idx={sensor_idx:2d}"
-                )
-
-            # Validate we found all 4 feet
-            if len(self._feet_ids) != 4:
-                raise RuntimeError(
-                    f"Expected 4 feet in robot, found {len(self._feet_ids)}: {self._feet_ids}"
-                )
-
-            if len(self._feet_ids_sensor) != 4:
-                raise RuntimeError(
-                    f"Expected 4 feet in sensor, found {len(self._feet_ids_sensor)}: "
-                    f"{self._feet_ids_sensor}"
-                )
-
-            # Verify sensor order matches expected foot order
-            print("\n" + "-" * 70)
-            print(" SENSOR ORDER VALIDATION")
-            print("-" * 70)
-
-            # Create mapping of sensor_idx -> foot_name
-            sensor_order = []
-            for i, name in enumerate(self._foot_names):
-                sensor_idx = self._feet_ids_sensor[i]
-                sensor_order.append((sensor_idx, name))
-
-            # Sort by sensor index to see actual order in sensor
-            sensor_order_sorted = sorted(sensor_order, key=lambda x: x[0])
-
-            print("Sensor indices in ascending order:")
-            for sensor_idx, name in sensor_order_sorted:
-                print(f"  Index {sensor_idx}: {name}")
-
-            # Check if our lookup order matches expected order
-            actual_order = [name for _, name in sensor_order_sorted]
-            expected_order = self._foot_names
-
-            if actual_order != expected_order:
-                print(f"\n⚠️  WARNING: Sensor body order differs from expected order!")
-                print(f"  Expected: {expected_order}")
-                print(f"  Actual:   {actual_order}")
-                print(f"  Using dynamic indexing to compensate...")
-            else:
-                print(f"\n✓ Sensor order matches expected order: {expected_order}")
-
-            print("\n" + "=" * 70)
-            print(" INITIALIZATION COMPLETE")
-            print("=" * 70)
-            print(f"✓ Robot body indices:  {self._feet_ids}")
-            print(f"✓ Sensor indices:      {self._feet_ids_sensor}")
-            print(f"✓ Observation space:   {self.cfg.observation_space} dims")
-            print(f"✓ Action space:        {self.cfg.action_space} dims")
-            print(f"✓ Num environments:    {self.num_envs}")
-            print("=" * 70 + "\n")
-
             self._indices_initialized = True
 
-        except RuntimeError:
-            raise
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize body indices: {e}. "
@@ -284,68 +213,56 @@ class Rob6323Go2Env(DirectRLEnv):
 
     @property
     def foot_positions_w(self) -> torch.Tensor:
-        """
-        Return foot positions in world frame as (num_envs, 4, 3).
-        Initializes foot body indices on first access if needed.
-        """
+        """Return foot positions in world frame as (num_envs, 4, 3)."""
         if not self._feet_ids:
             self._initialize_body_indices()
         return self.robot.data.body_pos_w[:, self._feet_ids]
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """
-        Cache current actions and compute desired joint positions (pre-physics).
-        """
+        """Cache current actions and compute desired joint positions."""
         if not self._indices_initialized:
             self._initialize_body_indices()
 
         self._actions = actions.clone()
-
-        # Target joint positions: default + scaled action offsets
         self.desired_joint_pos = (
             self.cfg.action_scale * self._actions + self.robot.data.default_joint_pos
         )
 
     def _apply_action(self) -> None:
-        """
-        Apply manual PD torques with friction model as joint effort targets.
-        """
-        #
-        # 1. Compute Base PD Torque
+        """Apply manual PD torques with friction model."""
+        # 1. Base PD torque
         pd_torque = (
             self.Kp * (self.desired_joint_pos - self.robot.data.joint_pos)
             - self.Kd * self.robot.data.joint_vel
         )
 
-        # 2. Compute Friction Torque (Bonus Implementation)
-        # formula: tau_friction = tau_stiction + tau_viscous
-        # tau_stiction = Fs * tanh(q_dot / 0.1)
-        # tau_viscous = mu_v * q_dot
+        # 2. Friction model
         q_dot = self.robot.data.joint_vel
-
         tau_stiction = self.friction_coeffs_stiction * torch.tanh(q_dot / 0.1)
         tau_viscous = self.friction_coeffs_viscous * q_dot
-
         tau_friction = tau_stiction + tau_viscous
 
-        # 3. Subtract Friction from PD Torque
+        # 3. Subtract friction
         torque_with_friction = pd_torque - tau_friction
 
-        # 4. Clip to Torque Limits
+        # 4. Clip to limits
         self._applied_torques = torch.clip(
             torque_with_friction, -self.torque_limits, self.torque_limits
         )
 
-        # 5. Send to Simulator
+        # 5. Send to simulator
         self.robot.set_joint_effort_target(self._applied_torques)
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         """
         Assemble and return the policy observation vector.
+        Flat terrain: 52 dims
+        Rough terrain: 52 + 187 = 239 dims (with height scan)
         """
         self._previous_actions = self._actions.clone()
 
-        obs: torch.Tensor = torch.cat(
+        # Base observations (52 dims)
+        base_obs = torch.cat(
             [
                 tensor
                 for tensor in (
@@ -363,7 +280,30 @@ class Rob6323Go2Env(DirectRLEnv):
             dim=-1,
         )
 
-        # One-time validation on first observation
+        # --- BONUS 2: ADD HEIGHT SCAN FOR ROUGH TERRAIN ---
+        if self._has_height_scanner:
+            # GridPattern(1.6, 1.0, 0.1) -> 17x11 = 187 rays
+
+            # --- FIXED LOGIC START ---
+            # ray_hits_w is the world Z position of the terrain
+            # root_pos_w is the world Z position of the robot base
+            # We want terrain height RELATIVE to the robot base
+
+            ground_z = self._height_scanner.data.ray_hits_w[:, :, 2]
+            robot_z = self.robot.data.root_pos_w[:, 2].unsqueeze(1)
+
+            height_data = ground_z - robot_z
+
+            # Clip to reasonable range (-1.0 to 1.0)
+            height_data = torch.clip(height_data, -1.0, 1.0)
+            # --- FIXED LOGIC END ---
+
+            # Concatenate with base observations
+            obs = torch.cat([base_obs, height_data], dim=-1)
+        else:
+            obs = base_obs
+
+        # One-time validation
         if not self._obs_validated:
             expected_dim = self.cfg.observation_space
             actual_dim = obs.shape[1]
@@ -379,9 +319,7 @@ class Rob6323Go2Env(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        """
-        Compute and return the scalar reward for each environment.
-        """
+        """Compute and return the scalar reward for each environment."""
         self._step_contact_targets()
 
         # Base tracking (exponential shaping)
@@ -396,7 +334,7 @@ class Rob6323Go2Env(DirectRLEnv):
         )
         yaw_rate_error_mapped: torch.Tensor = torch.exp(-yaw_rate_error / 0.25)
 
-        # Action-rate penalties (first and second differences)
+        # Action-rate penalties
         rew_action_rate: torch.Tensor = torch.sum(
             torch.square(self._actions - self.last_actions[:, :, 0]), dim=1
         ) * (self.cfg.action_scale**2)
@@ -410,10 +348,10 @@ class Rob6323Go2Env(DirectRLEnv):
             dim=1,
         ) * (self.cfg.action_scale**2)
 
-        # Raibert heuristic term
+        # Raibert heuristic
         rew_raibert: torch.Tensor = self._reward_raibert_heuristic()
 
-        # Refined stabilization / regularization terms
+        # Stabilization terms
         rew_orient: torch.Tensor = torch.sum(
             torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=1
         )
@@ -425,12 +363,12 @@ class Rob6323Go2Env(DirectRLEnv):
             torch.square(self.robot.data.root_ang_vel_b[:, :2]), dim=1
         )
 
-        # Torque L2 penalty
+        # Torque penalty
         rew_action_l2: torch.Tensor = torch.sum(
             torch.square(self._applied_torques), dim=1
         )
 
-        # Advanced foot interaction terms
+        # Foot interaction terms
         rew_feet_clearance: torch.Tensor = self._reward_feet_clearance()
         rew_tracking_contacts_shaped_force: torch.Tensor = (
             self._reward_tracking_contacts_shaped_force()
@@ -453,7 +391,7 @@ class Rob6323Go2Env(DirectRLEnv):
             * self.cfg.tracking_contacts_shaped_force_reward_scale,
         }
 
-        # Update action history (most recent at index 0)
+        # Update action history
         self.last_actions = torch.roll(self.last_actions, 1, 2)
         self.last_actions[:, :, 0] = self._actions
 
@@ -465,26 +403,18 @@ class Rob6323Go2Env(DirectRLEnv):
             for key, value in rewards.items():
                 if torch.isnan(value).any() or torch.isinf(value).any():
                     print(f"  Problem in reward: {key}")
-                    print(f"    Mean: {value.mean().item():.6f}")
-                    print(f"    Min:  {value.min().item():.6f}")
-                    print(f"    Max:  {value.max().item():.6f}")
-            raise RuntimeError(
-                "Invalid reward values detected! Check reward computations."
-            )
+            raise RuntimeError("Invalid reward values detected!")
 
-        # Logging: accumulate component values
+        # Logging
         for key, value in rewards.items():
             self._episode_sums[key] += value
 
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute and return termination flags.
-        """
+        """Compute and return termination flags."""
         time_out: torch.Tensor = self.episode_length_buf >= self.max_episode_length - 1
 
-        # With feet-only contact sensing, rely on height/orientation checks.
         cstr_upsidedown: torch.Tensor = self.robot.data.projected_gravity_b[:, 2] > 0
         base_height: torch.Tensor = self.robot.data.root_pos_w[:, 2]
         cstr_base_height_min: torch.Tensor = base_height < self.cfg.base_height_min
@@ -493,9 +423,7 @@ class Rob6323Go2Env(DirectRLEnv):
         return died, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
-        """
-        Reset the specified environments and populate episode logs.
-        """
+        """Reset the specified environments and populate episode logs."""
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = cast(Sequence[int], self.robot._ALL_INDICES)
 
@@ -509,7 +437,6 @@ class Rob6323Go2Env(DirectRLEnv):
 
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
-
         self.last_actions[env_ids] = 0.0
         self.gait_indices[env_ids] = 0.0
 
@@ -517,17 +444,13 @@ class Rob6323Go2Env(DirectRLEnv):
             -1.0, 1.0
         )
 
-        # --- BONUS IMPLEMENTATION: RANDOMIZE FRICTION ---
-        # Randomize friction params per-episode (per-robot)
-        # Viscous: U(0.0, 0.3), Stiction: U(0.0, 2.5)
+        # --- BONUS 1: RANDOMIZE FRICTION ---
         num_reset = len(env_ids)
-
         viscous_sample = torch.rand(num_reset, 1, device=self.device) * 0.3
         self.friction_coeffs_viscous[env_ids] = viscous_sample.expand(-1, 12)
 
         stiction_sample = torch.rand(num_reset, 1, device=self.device) * 2.5
         self.friction_coeffs_stiction[env_ids] = stiction_sample.expand(-1, 12)
-        # ------------------------------------------------
 
         joint_pos: torch.Tensor = self.robot.data.default_joint_pos[env_ids]
         joint_vel: torch.Tensor = self.robot.data.default_joint_vel[env_ids]
@@ -538,69 +461,52 @@ class Rob6323Go2Env(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
+        # Episode logging
         extras: dict[str, float] = {}
         for key in self._episode_sums.keys():
-            episodic_sum_avg: torch.Tensor = torch.mean(
-                self._episode_sums[key][env_ids]
-            )
-            extras["Episode_Reward/" + key] = float(
-                episodic_sum_avg / self.max_episode_length_s
-            )
-            self._episode_sums[key][env_ids] = 0.0
-
+            if key in self._episode_sums:
+                episodic_sum_avg: torch.Tensor = torch.mean(
+                    self._episode_sums[key][env_ids]
+                )
+                extras["Episode_Reward/" + key] = float(
+                    episodic_sum_avg / self.max_episode_length_s
+                )
+                self._episode_sums[key][env_ids] = 0.0
         self.extras["log"] = {}
         self.extras["log"].update(extras)
 
-        extras2: dict[str, float] = {}
-        extras2["Episode_Termination/base_contact"] = float(
-            torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        )
-        extras2["Episode_Termination/time_out"] = float(
-            torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        )
-        self.extras["log"].update(extras2)
-
     def _step_contact_targets(self) -> None:
         """
-        Advance gait phase and compute clock inputs and desired contact states.
+        Calculates the desired gait (contact schedule) based on a trot pattern.
         """
         frequencies: float = 3.0
         phases: float = 0.5
         durations: torch.Tensor = 0.5 * torch.ones((self.num_envs,), device=self.device)
-
         self.gait_indices = torch.remainder(
             self.gait_indices + self.step_dt * frequencies, 1.0
         )
-
-        foot_indices_list: list[torch.Tensor] = [
+        foot_indices_list = [
             self.gait_indices + phases,
             self.gait_indices,
             self.gait_indices,
             self.gait_indices + phases,
         ]
-
         self.foot_indices = torch.remainder(torch.stack(foot_indices_list, dim=1), 1.0)
-
-        warped_indices: torch.Tensor = self.foot_indices.clone()
+        warped_indices = self.foot_indices.clone()
         for i in range(4):
-            fi: torch.Tensor = warped_indices[:, i]
-            stance: torch.Tensor = fi < durations
-            swing: torch.Tensor = ~stance
+            fi = warped_indices[:, i]
+            stance = fi < durations
+            swing = ~stance
             fi[stance] = (fi[stance] / durations[stance]) * 0.5
             fi[swing] = (
                 0.5 + ((fi[swing] - durations[swing]) / (1 - durations[swing])) * 0.5
             )
             warped_indices[:, i] = fi
-
         self.clock_inputs = torch.sin(2 * np.pi * warped_indices)
-
-        kappa: float = 0.07
+        kappa = 0.07
         cdf = torch.distributions.normal.Normal(0, kappa).cdf
 
-        def smooth(fi: torch.Tensor) -> torch.Tensor:
-            """
-            Smooth a phase signal into a soft stance/swing indicator.
-            """
+        def smooth(fi):
             return cdf(torch.remainder(fi, 1.0)) * (
                 1 - cdf(torch.remainder(fi, 1.0) - 0.5)
             ) + cdf(torch.remainder(fi, 1.0) - 1.0) * (
@@ -611,80 +517,46 @@ class Rob6323Go2Env(DirectRLEnv):
             self.desired_contact_states[:, i] = smooth(warped_indices[:, i])
 
     def _reward_raibert_heuristic(self) -> torch.Tensor:
-        """
-        Compute Raibert-style foot placement error in the body-yaw frame.
-        """
-        foot_rel: torch.Tensor = (
-            self.foot_positions_w - self.robot.data.root_pos_w.unsqueeze(1)
-        )
-        foot_body: torch.Tensor = torch.zeros(self.num_envs, 4, 3, device=self.device)
-
+        foot_rel = self.foot_positions_w - self.robot.data.root_pos_w.unsqueeze(1)
+        foot_body = torch.zeros(self.num_envs, 4, 3, device=self.device)
         for i in range(4):
             foot_body[:, i, :] = math_utils.quat_apply_yaw(
                 math_utils.quat_conjugate(self.robot.data.root_quat_w),
                 foot_rel[:, i, :],
             )
-
-        # Note: self.ys_nom and self.xs_nom are pre-allocated in __init__
-        phases: torch.Tensor = torch.abs(1.0 - self.foot_indices * 2.0) - 0.5
-        freq: float = 3.0
-
-        x_vel: torch.Tensor = self._commands[:, 0:1]
-        yaw_vel: torch.Tensor = self._commands[:, 2:3]
-        y_vel: torch.Tensor = yaw_vel * self.desired_length / 2
-
-        ys_offset: torch.Tensor = phases * y_vel * (0.5 / freq)
+        phases = torch.abs(1.0 - self.foot_indices * 2.0) - 0.5
+        freq = 3.0
+        x_vel = self._commands[:, 0:1]
+        yaw_vel = self._commands[:, 2:3]
+        y_vel = yaw_vel * self.desired_length / 2
+        ys_offset = phases * y_vel * (0.5 / freq)
         ys_offset[:, 2:4] *= -1
-        xs_offset: torch.Tensor = phases * x_vel * (0.5 / freq)
-
-        ys_des: torch.Tensor = self.ys_nom + ys_offset
-        xs_des: torch.Tensor = self.xs_nom + xs_offset
-
-        desired: torch.Tensor = torch.cat(
-            (xs_des.unsqueeze(2), ys_des.unsqueeze(2)), dim=2
-        )
-        err: torch.Tensor = torch.abs(desired - foot_body[:, :, 0:2])
+        xs_offset = phases * x_vel * (0.5 / freq)
+        ys_des = self.ys_nom + ys_offset
+        xs_des = self.xs_nom + xs_offset
+        desired = torch.cat((xs_des.unsqueeze(2), ys_des.unsqueeze(2)), dim=2)
+        err = torch.abs(desired - foot_body[:, :, 0:2])
         return torch.sum(torch.square(err), dim=(1, 2))
 
     def _reward_feet_clearance(self) -> torch.Tensor:
-        """
-        Penalize feet that are too low during swing.
-        """
-        target_height: float = 0.1
-        is_swing: torch.Tensor = self.desired_contact_states < 0.5
-        foot_z: torch.Tensor = self.foot_positions_w[:, :, 2]
-        delta: torch.Tensor = target_height - foot_z
-        penalty: torch.Tensor = torch.square(torch.clip(delta, min=0.0)) * is_swing
+        target_height = 0.1
+        is_swing = self.desired_contact_states < 0.5
+        foot_z = self.foot_positions_w[:, :, 2]
+        delta = target_height - foot_z
+        penalty = torch.square(torch.clip(delta, min=0.0)) * is_swing
         return torch.sum(penalty, dim=1)
 
     def _reward_tracking_contacts_shaped_force(self) -> torch.Tensor:
-        """
-        Reward matching desired contact forces based on desired contact schedule.
-        """
-        # Get all forces from sensor (shape: num_envs, num_bodies_in_sensor, 3)
-        all_forces: torch.Tensor = self._contact_sensor.data.net_forces_w
-
-        # Index only the 4 feet using our pre-computed sensor indices
-        foot_forces: torch.Tensor = all_forces[:, self._feet_ids_sensor, :]
-
-        # Compute force magnitudes (shape: num_envs, 4)
-        foot_forces_norm: torch.Tensor = torch.norm(foot_forces, dim=-1)
-
-        # Physics-based target force
-        robot_weight_approx: float = 12.0 * 9.81  # kg * m/s^2 = N
-        nominal_force: float = robot_weight_approx / 2.0  # Trot: ~2 feet in contact
-
-        # Desired forces based on gait phase
-        desired_forces: torch.Tensor = self.desired_contact_states * nominal_force
-
-        # Exponentially shaped error
-        error: torch.Tensor = foot_forces_norm - desired_forces
+        all_forces = self._contact_sensor.data.net_forces_w
+        foot_forces = all_forces[:, self._feet_ids_sensor, :]
+        foot_forces_norm = torch.norm(foot_forces, dim=-1)
+        robot_weight_approx = 12.0 * 9.81
+        nominal_force = robot_weight_approx / 2.0
+        desired_forces = self.desired_contact_states * nominal_force
+        error = foot_forces_norm - desired_forces
         return torch.exp(-torch.sum(torch.square(error), dim=1) / nominal_force)
 
     def _set_debug_vis_impl(self, debug_vis: bool) -> None:
-        """
-        Toggle debug markers for commanded/current velocity visualization.
-        """
         if debug_vis:
             if not hasattr(self, "goal_vel_visualizer"):
                 self.goal_vel_visualizer = VisualizationMarkers(
@@ -701,12 +573,9 @@ class Rob6323Go2Env(DirectRLEnv):
                 self.current_vel_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event: Any) -> None:
-        """
-        Render desired and current XY velocity arrows at the robot base.
-        """
         if not self.robot.is_initialized:
             return
-        base_pos_w: torch.Tensor = self.robot.data.root_pos_w.clone()
+        base_pos_w = self.robot.data.root_pos_w.clone()
         base_pos_w[:, 2] += 0.5
         vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_xy_velocity_to_arrow(
             self._commands[:, :2]
@@ -724,19 +593,14 @@ class Rob6323Go2Env(DirectRLEnv):
     def _resolve_xy_velocity_to_arrow(
         self, xy_velocity: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert XY velocity vectors into marker scale and orientation quaternions.
-        """
         default_scale = self.goal_vel_visualizer.cfg.markers["arrow"].scale
-        arrow_scale: torch.Tensor = torch.tensor(
+        arrow_scale = torch.tensor(
             default_scale, device=self.device, dtype=torch.float32
         ).repeat(xy_velocity.shape[0], 1)
         arrow_scale[:, 0] *= torch.linalg.norm(xy_velocity, dim=1) * 3.0
-        heading_angle: torch.Tensor = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
-        zeros: torch.Tensor = torch.zeros_like(heading_angle)
-        arrow_quat: torch.Tensor = math_utils.quat_from_euler_xyz(
-            zeros, zeros, heading_angle
-        )
-        base_quat_w: torch.Tensor = self.robot.data.root_quat_w
+        heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
+        zeros = torch.zeros_like(heading_angle)
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, heading_angle)
+        base_quat_w = self.robot.data.root_quat_w
         arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
         return arrow_scale, arrow_quat
